@@ -11,3 +11,5 @@ wheels/
 # Virtual environments
 .venv
 src/va/data/
+*.md
+!README.md

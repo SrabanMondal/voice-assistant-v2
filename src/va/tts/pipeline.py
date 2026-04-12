@@ -1,10 +1,11 @@
+import time
 import re
 from multiprocessing.queues import Queue
 
 import numpy as np
 
 from src.va.config.va_config import VAConfig
-from src.va.ipc.events import Event, TTSDoneEvent
+from src.va.ipc.events import Event, PipelineMarkerEvent, TTSDoneEvent
 from src.va.orchestrator.turn_context import TurnContext
 from src.va.response.types import GeneratedToken
 
@@ -33,6 +34,7 @@ class TTSPipeline:
         # Buffer for sentence construction
         self.text_buffer = ""
         self.sentence_endings = re.compile(r"[.!?;:]")
+        self._first_audio_marked_turn_ids: set[int] = set()
 
     def run(self):
         print("[TTS] Worker Ready.")
@@ -119,6 +121,15 @@ class TTSPipeline:
             sample_rate=self.engine.sample_rate,
             ctx=ctx,
         )
+        if ctx.turn_id not in self._first_audio_marked_turn_ids:
+            self.event_queue.put(
+                PipelineMarkerEvent(
+                    marker="tts_first_audio_emit",
+                    t_mono_ns=time.monotonic_ns(),
+                    turn_id=ctx.turn_id,
+                )
+            )
+            self._first_audio_marked_turn_ids.add(ctx.turn_id)
         self.playback_queue.put(packet)
 
     def _float_to_int16(self, audio: np.ndarray) -> np.ndarray:

@@ -5,7 +5,7 @@ import numpy as np
 
 from src.va.audio.types import AudioFrame
 from src.va.config.va_config import VAConfig
-from src.va.ipc.events import Event, STTFinalEvent
+from src.va.ipc.events import Event, PipelineMarkerEvent, STTFinalEvent
 from src.va.stt.stt_engine import MoonshineSTT
 from src.va.stt.types import TranscriptionMsg
 from src.va.stt.vad_engine import SileroVAD
@@ -47,6 +47,7 @@ class SpeechPipeline:
         # Timers
         self.silence_start_time = None
         self.last_partial_time = 0.0
+        self._partial_marker_emitted = False
 
     def run(self):
         """The infinite loop worker."""
@@ -78,6 +79,7 @@ class SpeechPipeline:
             self.is_triggered = True
             self.buffer = []
             self.last_partial_time = 0.0
+            self._partial_marker_emitted = False
 
         self.buffer.append(frame.pcm)
 
@@ -125,6 +127,14 @@ class SpeechPipeline:
         """
         text = self._transcribe_buffer()
         if len(text) > 2:
+            if not self._partial_marker_emitted:
+                self.event_queue.put(
+                    PipelineMarkerEvent(
+                        marker="stt_first_partial",
+                        t_mono_ns=time.monotonic_ns(),
+                    )
+                )
+                self._partial_marker_emitted = True
             # self.text_queue.put(TranscriptionMsg(
             #     text=text,
             #     type=TranscriptionType.PARTIAL,
@@ -142,6 +152,12 @@ class SpeechPipeline:
         text = self._transcribe_buffer()
 
         if len(text) > 0:
+            self.event_queue.put(
+                PipelineMarkerEvent(
+                    marker="stt_final_emit",
+                    t_mono_ns=time.monotonic_ns(),
+                )
+            )
             # self.text_queue.put(TranscriptionMsg(
             #     text=text,
             #     type=TranscriptionType.FINAL,
@@ -155,6 +171,7 @@ class SpeechPipeline:
         self.is_triggered = False
         self.silence_start_time = None
         self.buffer = []
+        self._partial_marker_emitted = False
         print(" [Speech End] State Reset.")
 
     def _transcribe_buffer(self) -> str:

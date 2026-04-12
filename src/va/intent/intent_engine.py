@@ -42,7 +42,7 @@ class IntentEngine:
         self,
         text_queue: Queue[TranscriptionMsg],
         event_queue: Queue[Event],
-        model="qwen:0.5b",
+        model="qwen3:0.6b",
     ):
         self.text_queue = text_queue
         self.event_queue = event_queue

@@ -1,6 +1,7 @@
+import time
 from multiprocessing.queues import Queue
 
-from src.va.ipc.events import Event, GenerationDoneEvent
+from src.va.ipc.events import Event, GenerationDoneEvent, PipelineMarkerEvent
 from src.va.response.llm_engine import LLMEngine
 
 from .types import GeneratedToken, GenerationTask
@@ -35,9 +36,19 @@ class ResponseWorker:
                 print(f"[Response] Generating for Request: {task.ctx.turn_id}")
 
                 full_response_accumulator = []
+                first_token_emitted = False
 
                 # Direct Stream Loop
                 for token in self.engine.generate_stream(task.messages):
+                    if not first_token_emitted:
+                        self.event_queue.put(
+                            PipelineMarkerEvent(
+                                marker="llm_first_token",
+                                t_mono_ns=time.monotonic_ns(),
+                                turn_id=task.ctx.turn_id,
+                            )
+                        )
+                        first_token_emitted = True
                     self.tts_text_queue.put(GeneratedToken(token=token, ctx=task.ctx))
 
                     full_response_accumulator.append(token)

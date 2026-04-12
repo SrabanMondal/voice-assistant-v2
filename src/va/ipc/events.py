@@ -50,3 +50,11 @@ class TTSDoneEvent(Event):
 @dataclass(frozen=True)
 class PlayBackEvent(Event):
     type: ClassVar[str] = "PLAY_DONE"
+
+
+@dataclass(frozen=True)
+class PipelineMarkerEvent(Event):
+    marker: str
+    t_mono_ns: int
+    turn_id: int | None = None
+    type: ClassVar[str] = "PIPELINE_MARKER"

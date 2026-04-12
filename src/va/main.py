@@ -84,7 +84,7 @@ def run():
     )
 
     playback_thread = threading.Thread(
-        target=playback_thread_func, args=(play_q,), daemon=True
+        target=playback_thread_func, args=(play_q,event_q), daemon=True
     )
 
     wake_proc.start()

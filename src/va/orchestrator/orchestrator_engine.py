@@ -1,4 +1,5 @@
 import time
+from queue import Empty
 from typing import Dict, List
 
 from src.va.intent.types import ActionType
@@ -17,8 +18,10 @@ class Orchestrator:
     Manages State, History, and Routing.
     """
 
-    def __init__(self):
+    def __init__(self, *, parallel_intent: bool = False, disable_intent: bool = False):
         self._state = "IDLE"
+        self.parallel_intent = parallel_intent and not disable_intent
+        self.disable_intent = disable_intent
         # System Prompt for the Response LLM (Personality)
         self.system_prompt = (
             "You are a helpful desktop assistant. Keep answers concise. "
@@ -30,6 +33,7 @@ class Orchestrator:
 
         # Turn context
         self.turn_ctx = TurnContext(1)
+        self._pending_transcripts: Dict[int, str] = {}
 
     def allow_stt_audio(self) -> bool:
         return self._state == "LISTENING"
@@ -97,19 +101,19 @@ class Orchestrator:
 
         print(f"\n[User (Final)]: {event.text}")
         self._state = "THINKING"
+        self._pending_transcripts[self.turn_ctx.turn_id] = event.text
+
+        if self.disable_intent:
+            self._dispatch_response(event.text, comps, self.turn_ctx)
+            return
+
+        if self.parallel_intent:
+            self._dispatch_response(event.text, comps, self.turn_ctx)
 
         # Forward to Intent Engine
         # STT to Intent is managed by orchestrator, well thats because if later we need to handle
         # streaming STT to intent, via debouncing using buffer.
-
-        comps["intent_q"].put(
-            TranscriptionMsg(
-                text=event.text,
-                type=TranscriptionType.FINAL,
-                timestamp=time.time(),
-                ctx=self.turn_ctx,
-            )
-        )
+        self._forward_to_intent(event.text, comps, self.turn_ctx)
 
     def _on_intent(self, event: IntentEvent, comps: dict) -> None:
         if event.ctx.cancelled.is_set():
@@ -119,38 +123,99 @@ class Orchestrator:
             f"[Orchestrator] Intent: {result.action_type.value} | Query: {result.refined_query}"
         )
 
-        # 1. Update History (User Turn)
-        self.history.append({"role": "user", "content": result.refined_query})
+        if self.parallel_intent:
+            if event.ctx.turn_id != self.turn_ctx.turn_id:
+                return
+            if result.action_type == ActionType.TOOL_USE:
+                self._interrupt_and_reroute(result, comps)
+            return
 
+        self._dispatch_from_intent_result(result, comps, event.ctx)
+
+    def _dispatch_from_intent_result(
+        self,
+        result,
+        comps: dict,
+        ctx: TurnContext,
+    ) -> None:
+        query_text = (result.refined_query or "").strip()
+        if not query_text:
+            return
+
+        self._maybe_run_tools(result)
+        self._dispatch_response(query_text, comps, ctx)
+
+    def _interrupt_and_reroute(self, result, comps: dict) -> None:
+        print("[Orchestrator] Intent requested reroute; interrupting current turn")
+        old_ctx = self.turn_ctx
+        old_turn_id = old_ctx.turn_id
+        old_ctx.cancelled.set()
+        self._clear_queue(comps.get("playback_q"))
+
+        self.turn_ctx = TurnContext(turn_id=old_turn_id + 1)
+        reroute_query = (result.refined_query or self._pending_transcripts.pop(old_turn_id, "")).strip()
+        if not reroute_query:
+            self._state = "IDLE"
+            return
+
+        self._maybe_run_tools(result)
+        self._dispatch_response(reroute_query, comps, self.turn_ctx)
+
+    def _maybe_run_tools(self, result) -> None:
         # 2. Handle Tools (The Hub Logic)
         # Need to Implement, but currently not required for myself.
-        tool_outputs = []
-        if result.action_type == ActionType.TOOL_USE:
-            print(f"[Orchestrator] Executing Tools: {result.tool_calls}")
-            # --- EXECUTE TOOLS HERE ---
-            # output = tool_registry.execute(result.tool_calls)
-            # For now, simulate:
-            output = "Simulated Tool Output: Operation Successful."
-            tool_outputs.append(output)
-            # Here we have to diverge to differentiate -- tool usage v/s desktop control --
-            # Add Tool Output to History for tool usage, like google search
-            self.history.append({"role": "system", "content": f"Tool Result: {output}"})
-            # if desktop control - execute python scripts to control desktop and simulating Keyboard keys
-            # No generating task needed, unlesss explicit stated, well that needs more sophisticated system
-            # --- to be implemented ---
+        if result.action_type != ActionType.TOOL_USE:
+            return
 
-        # Need to implement if Action Type is Ignore, well thats later..
-        
+        print(f"[Orchestrator] Executing Tools: {result.tool_calls}")
+        # --- EXECUTE TOOLS HERE ---
+        # output = tool_registry.execute(result.tool_calls)
+        # For now, simulate:
+        output = "Simulated Tool Output: Operation Successful."
+        # Here we have to diverge to differentiate -- tool usage v/s desktop control --
+        # Add Tool Output to History for tool usage, like google search
+        self.history.append({"role": "system", "content": f"Tool Result: {output}"})
+        # if desktop control - execute python scripts to control desktop and simulating Keyboard keys
+        # No generating task needed, unlesss explicit stated, well that needs more sophisticated system
+        # --- to be implemented ---
+
+    def _dispatch_response(self, text: str, comps: dict, ctx: TurnContext) -> None:
+        self.history.append({"role": "user", "content": text})
+
         # 3. Construct Prompt for Response LLM
         task = GenerationTask(
             messages=self.history,
-            ctx=self.turn_ctx,
+            ctx=ctx,
         )
 
         # 4. Dispatch
-         # Switch state early because TTS streams immediately, but later I need Thinking if I set qwen to thinking mode..
+        # Switch state early because TTS streams immediately, but later I need Thinking if I set qwen to thinking mode..
         self._state = "SPEAKING"
         comps["response_q"].put(task)
+
+    def _forward_to_intent(self, text: str, comps: dict, ctx: TurnContext) -> None:
+        intent_q = comps.get("intent_q")
+        if intent_q is None:
+            return
+        intent_q.put(
+            TranscriptionMsg(
+                text=text,
+                type=TranscriptionType.FINAL,
+                timestamp=time.time(),
+                ctx=ctx,
+            )
+        )
+
+    def _clear_queue(self, q) -> None:
+        if q is None:
+            return
+        while True:
+            try:
+                q.get_nowait()
+            except Empty:
+                break
+            except Exception:
+                break
 
     def _on_generation_done(self, event: GenerationDoneEvent) -> None:
         """
@@ -160,6 +225,7 @@ class Orchestrator:
             return
         print(f"\n[Assistant]: {event.full_text}")
         self.history.append({"role": "assistant", "content": event.full_text})
+        self._pending_transcripts.pop(event.ctx.turn_id, None)
         if len(self.history) > 10:
             self.history = self.history[-10:]
 

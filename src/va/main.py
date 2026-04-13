@@ -106,7 +106,7 @@ def run():
         frame_size=512,
     )
 
-    ost = Orchestrator()
+    ost = Orchestrator(parallel_intent=True)
 
     # -------------------------
     # Clean Shutdown

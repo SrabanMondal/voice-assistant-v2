@@ -127,6 +127,11 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
+    parser.add_argument(
+        "--disable-intent",
+        action="store_true",
+        help="Bypass intent in eval: route STT final directly to response worker",
+    )
     return parser.parse_args()
 
 
@@ -228,12 +233,6 @@ def _format_ratio(name: str, value: float | None) -> str:
     return f"{name}: {value:.2f}"
 
 
-def _format_ratio(name: str, value: float | None) -> str:
-    if value is None:
-        return f"{name}: N/A"
-    return f"{name}: {value:.2f}"
-
-
 def run_eval(args: argparse.Namespace) -> int:
     configure_logging(args.log_level)
 
@@ -273,7 +272,9 @@ def run_eval(args: argparse.Namespace) -> int:
     audio_q_wake: mp.Queue[AudioFrame] = mp.Queue(maxsize=32)
     audio_q_stt: mp.Queue[AudioFrame] = mp.Queue(maxsize=64)
     stt_text_q: mp.Queue[TranscriptionMsg] = mp.Queue()
-    intent_q: mp.Queue = mp.Queue()
+    intent_q: mp.Queue | None = None
+    if not args.disable_intent:
+        intent_q = mp.Queue()
     prompt_q: mp.Queue[GenerationTask] = mp.Queue()
     tts_text_q: mp.Queue[GeneratedToken | None] = mp.Queue()
     play_q: mp.Queue[TTSAudio] = mp.Queue()
@@ -302,11 +303,6 @@ def run_eval(args: argparse.Namespace) -> int:
         args=(audio_q_stt, stt_text_q, event_q, cfg),
         daemon=True,
     )
-    intent_proc = mp.Process(
-        target=run_intent_worker,
-        args=(intent_q, event_q),
-        daemon=True,
-    )
     response_proc = mp.Process(
         target=run_response_worker,
         args=(prompt_q, tts_text_q, event_q),
@@ -318,7 +314,17 @@ def run_eval(args: argparse.Namespace) -> int:
         daemon=True,
     )
 
-    processes.extend([stt_proc, intent_proc, response_proc, tts_proc])
+    processes.extend([stt_proc, response_proc, tts_proc])
+
+    if not args.disable_intent:
+        intent_proc = mp.Process(
+            target=run_intent_worker,
+            args=(intent_q, event_q),
+            daemon=True,
+        )
+        processes.append(intent_proc)
+    else:
+        LOGGER.info("Intent worker disabled in eval mode; STT final routes directly to response")
 
     playback_state = PlaybackProbeState()
     playback_thread = threading.Thread(
@@ -328,7 +334,10 @@ def run_eval(args: argparse.Namespace) -> int:
     )
 
     ring = RingBuffer(seconds=2.0, sample_rate=args.sample_rate, frame_size=args.frame_size)
-    orchestrator = Orchestrator()
+    orchestrator = Orchestrator(
+        parallel_intent=True,
+        disable_intent=args.disable_intent,
+    )
 
     components = {
         "stt_audio_q": audio_q_stt,
@@ -563,24 +572,6 @@ def run_eval(args: argparse.Namespace) -> int:
             stt_final_event_s = stt_final_event_ns / 1_000_000_000.0
             rtf_system = (playback_state.playback_end_ts - stt_final_event_s) / input_audio_duration_s
 
-        ttft_ms = _delta_ms(timeline_ns, "intent_event", "llm_first_token")
-
-        input_audio_duration_s = (replay_frame_count * args.frame_size) / args.sample_rate
-
-        rtf_e2e = None
-        if playback_state.playback_end_ts is not None and input_audio_duration_s > 0:
-            rtf_e2e = (playback_state.playback_end_ts - turn_input_start) / input_audio_duration_s
-
-        rtf_system = None
-        stt_final_event_ns = timeline_ns.get("stt_final_event")
-        if (
-            playback_state.playback_end_ts is not None
-            and stt_final_event_ns is not None
-            and input_audio_duration_s > 0
-        ):
-            stt_final_event_s = stt_final_event_ns / 1_000_000_000.0
-            rtf_system = (playback_state.playback_end_ts - stt_final_event_s) / input_audio_duration_s
-
         cpu_idle_pct = sampler.mean_cpu_between(idle_start, idle_end)
         cpu_active_pct = sampler.mean_cpu_between(active_start, active_end)
         memory_peak_mb = sampler.peak_memory_mb_between(active_start, active_end)
@@ -591,11 +582,6 @@ def run_eval(args: argparse.Namespace) -> int:
         print(format_metric("cpu_idle_pct", cpu_idle_pct, " %"))
         print(format_metric("cpu_active_pct", cpu_active_pct, " %"))
         print(format_metric("memory_peak_mb", memory_peak_mb, " MB"))
-
-        print("\n=== Additional Metrics ===")
-        print(_format_delta("ttft_ms", ttft_ms))
-        print(_format_ratio("rtf_system", rtf_system))
-        print(_format_ratio("rtf_e2e", rtf_e2e))
 
         print("\n=== Additional Metrics ===")
         print(_format_delta("ttft_ms", ttft_ms))
@@ -621,6 +607,7 @@ def run_eval(args: argparse.Namespace) -> int:
 
         print("\n=== Streaming Deltas ===")
         print(_format_delta("STT_final -> IntentEvent", _delta_ms(timeline_ns, "stt_final_event", "intent_event")))
+        print(_format_delta("STT_final -> First LLM token", _delta_ms(timeline_ns, "stt_final_event", "llm_first_token")))
         print(_format_delta("IntentEvent -> First LLM token", _delta_ms(timeline_ns, "intent_event", "llm_first_token")))
         print(_format_delta("First LLM token -> GenerationDone", _delta_ms(timeline_ns, "llm_first_token", "generation_done_event")))
         print(_format_delta("First LLM token -> First TTS audio", _delta_ms(timeline_ns, "llm_first_token", "tts_first_audio_emit")))
@@ -712,16 +699,19 @@ def run_eval(args: argparse.Namespace) -> int:
                     process.exitcode,
                 )
 
-        for q, qname in [
+        queues_to_close = [
             (audio_q_wake, "audio_q_wake"),
             (audio_q_stt, "audio_q_stt"),
             (stt_text_q, "stt_text_q"),
-            (intent_q, "intent_q"),
             (prompt_q, "prompt_q"),
             (tts_text_q, "tts_text_q"),
             (play_q, "play_q"),
             (event_q, "event_q"),
-        ]:
+        ]
+        if intent_q is not None:
+            queues_to_close.append((intent_q, "intent_q"))
+
+        for q, qname in queues_to_close:
             try:
                 q.cancel_join_thread()
                 q.close()
